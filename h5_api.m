@@ -17,7 +17,7 @@ classdef h5_api < handle
       %       - `filename` (char) -- .h5 file to connect to.
       
       if ( nargin == 0 ), return; end;
-      obj.assert__file_exists( obj.h5_file, 'the .h5 file' );
+      obj.assert__file_exists( filename, 'the .h5 file' );
       obj.h5_file = filename;
     end
     
@@ -277,6 +277,53 @@ classdef h5_api < handle
       
       obj.assert__is_set( sname );
       val = h5readatt( obj.h5_file, sname, att );
+    end
+    
+    function writeatt(obj, sname, att_name, att)
+      
+      %   WRITEATT -- Write an attribute to a given dataset.
+      %
+      %     IN:
+      %       - `sname` (char) -- Full path to the dataset.
+      %       - `att_name` (char) -- Name of the attribute to write to.
+      %       - `att` (double, char) -- Value to write.
+      
+      obj.assert__is_set( sname );
+      h5writeatt( obj.h5_file, sname, att_name, att );
+    end
+    
+    function encodeatt(obj, sname, att_name, att)
+      
+      %   ENCODEATT -- Write an attribute to a given dataset, after
+      %     encoding it to a JSON string.
+      %
+      %     IN:
+      %       - `sname` (char) -- Full path to the dataset.
+      %       - `att_name` (char) -- Name of the attribute to write to.
+      %       - `att` (double, char) -- Value to write.
+      
+      att = json( 'encode', att );
+      obj.writeatt( sname, att_name, att );
+    end
+    
+    function att = decodeatt(obj, sname, att)
+      
+      %   DECODEATT -- Read an attribute from a given dataset, and parse it
+      %     into a Matlab variable.
+      %
+      %     IN:
+      %       - `sname` (char) -- Full path to the dataset.
+      %       - `att` (char) -- Attribute to read.
+      
+      att = obj.readatt( sname, att );
+      att = json( 'parse', att );
+    end
+    
+    function att = parseatt(obj, sname, att)
+      
+      %   PARSEATT -- Alias for `decodeatt()`.
+      
+      att = obj.decodeatt( sname, att );
     end
     
     function labels = read_labels_(obj, gname)
