@@ -3,6 +3,7 @@ classdef h5_api < handle
   properties
     h5_file = NaN;
     CHUNK_SIZE = [1e3 1e2 1e2];
+    COMPRESSION_LEVEL = 4;
   end
   
   methods
@@ -78,30 +79,93 @@ classdef h5_api < handle
       if ( isnan(obj.h5_file) ), obj.h5_file = filename; end
     end
     
-    function write(obj, container, gname)
+    function create_set(obj, spath, sz, chunk, varargin)
       
-      %   WRITE -- Write data in a Container object to a given group.
+      %   CREATE_SET -- Create a numeric dataset.
+      %
+      %     IN:
+      %       - `spath` (char) -- Path to the dataset to create.
+      %       - `sz` (double) -- Size of the dataset. If any elements are
+      %         Inf, the dataset is extensible in those dimensions.
+      %       - `chunk` (double) |OPTIONAL| -- Optionally specify the
+      %         chunk-size of the dataset, if the set is to be extensible.
+      
+      spath = obj.ensure_leading_backslash( spath );
+      obj.assert__is_not_set( spath );
+      if ( nargin < 4 ), chunk = []; end;
+      if ( ~any(isinf(sz)) )
+        %   create non-extensible.
+        h5create( obj.h5_file, spath, sz, 'deflate', obj.COMPRESSION_LEVEL ...
+          , varargin{:} );
+        obj.writeatt( spath, 'next_row', -1 );
+        return;
+      end
+      if ( isempty(chunk) )
+        chunk = obj.get_chunk_( sz ); 
+      else
+        assert( numel(chunk) == numel(sz), ['If specifying a chunk' ...
+          , ' size, the number of elements must match the number of' ...
+          , ' elements in the dataset size vector.'] );
+      end
+      h5create( obj.h5_file, spath, sz, 'ChunkSize', chunk ...
+        , 'deflate', obj.COMPRESSION_LEVEL, varargin{:} );
+      obj.writeatt( spath, 'next_row', 0 );
+    end
+    
+    function write(obj, data, sgpath)
+      
+      %   WRITE -- Write data to a dataset or multiple datasets, depending
+      %     on the type of data.
+      %
+      %     If the dataset(s) already exist, they will be overwritten.
+      %     Otherwise, they will be created as extensible in the first
+      %     dimension.
+      %
+      %     obj.write( container, group_path ) writes the data and labels
+      %     of a Container object to datasets '/data' and '/labels' in the
+      %     given group path, marking that group as housing a Container
+      %     object.
+      %
+      %     obj.write( data, set_path ) writes the data of a numeric matrix
+      %     to 
+      
+      if ( isa(data, 'Container') )
+        obj.write_container( data, sgpath );
+      elseif ( isnumeric(data) )
+        obj.write_matrix( data, sgpath );
+      else
+        error( 'Unsupported data type ''%s''', class(data) );
+      end
+    end
+    
+    function write_container(obj, container, gname)
+      
+      %   WRITE_CONTAINER -- Write a Container object to datasets in a
+      %     given group.
       %
       %     If the datasets /data and /labels in the given group already
       %     exist, they will be unlinked (deleted).
+      %
+      %     IN:
+      %       - `container` (Container) -- Container object to save.
+      %       - `gname` (char) -- Path to the group in which to save.
       
-      obj.assert__isa( container, 'Container' );
       obj.assert__is_group( gname );
       gname = obj.ensure_leading_backslash( gname );
       
       data_set_path = [ gname, '/data' ];
       label_set_path = [ gname, '/labels' ];
       
-      if ( obj.is_set( data_set_path ) ), obj.unlink( data_set_path ); end
-      if ( obj.is_set( label_set_path ) ), obj.unlink( label_set_path ); end
+      if ( obj.is_set(data_set_path) ), obj.unlink( data_set_path ); end
+      if ( obj.is_set(label_set_path) ), obj.unlink( label_set_path ); end
       
-      obj.write_( container, gname, 1 );
+      obj.write_container_( container, gname, 1 );
     end
     
-    function write_(obj, container, gname, start)
+    function write_container_(obj, container, gname, start)
       
-      %   WRITE_ -- Private function for writing data to an extendible
-      %     dataset, starting from a given row.
+      %   WRITE_CONTAINER_ -- Private function for writing a Container
+      %     object to an extensible dataset, starting from a given row.
       
       data_set_path = [ gname, '/data' ];
       label_set_path = [ gname, '/labels' ];
@@ -117,49 +181,153 @@ classdef h5_api < handle
       labs = labels.labels;
       
       if ( ~obj.is_set(data_set_path) )
-        make_container_set();
-        next_row = size( data, 1 ) + 1;
+        obj.write_matrix_( data, data_set_path, 1 );
+        obj.write_matrix_( indices, label_set_path, 1, [Inf, Inf], [] ...
+          , 'FillValue', 0 );
       else
-        current_row = h5readatt( obj.h5_file, data_set_path, 'next_row' );
-        next_row = current_row + size( data, 1 );
-        [indices, labs, categories] = obj.match_( label_set_path, indices, labs, categories );
+        [indices, labs, categories] = ...
+          obj.match_( label_set_path, indices, labs, categories );
+        obj.write_matrix_( data, data_set_path, start );
+        obj.write_matrix_( indices, label_set_path, start );
       end
-      
-      [data_start, data_count] = get_start_count( data, start );
-      [label_start, label_count] = get_start_count( indices, start );
-            
-      h5write( obj.h5_file, data_set_path, data, data_start, data_count );
-      h5write( obj.h5_file, label_set_path, indices, label_start, label_count );
       
       categories = json( 'encode', categories );
       labs = json( 'encode', labs );
       
-      h5writeatt( obj.h5_file, label_set_path, 'categories', categories );
-      h5writeatt( obj.h5_file, label_set_path, 'labels', labs );
+      obj.writeatt( label_set_path, 'categories', categories );
+      obj.writeatt( label_set_path, 'labels', labs );
+      obj.writeatt( data_set_path, 'class', class(container) );
+      obj.writeatt( gname, 'class', class(container) );
+    end
+    
+    function write_matrix(obj, mat, spath)
       
-      h5writeatt( obj.h5_file, data_set_path, 'class', class(container) );
-      h5writeatt( obj.h5_file, data_set_path, 'next_row', next_row );
+      %   WRITE_MATRIX -- Write a numeric matrix to a dataset, erasing the
+      %     current contents.
+      %
+      %     IN:
+      %       - `mat` (double, uint8) -- Data matrix to save.
+      %       - `spath` (char) -- Path to the dataset in which to save. The
+      %         set will be created if it does not exist.
       
-      function [sz, chunk] = get_sz_chunk( mat )        
-        sz = size( mat );
-        dims = numel( sz );
-        sz(1) = Inf;
-        chunk = obj.CHUNK_SIZE( 1:dims );
-        chunk = min( [chunk; sz] );
-      end 
-      function [start, count] = get_start_count( mat, start )
-        dims = ndims( mat );
-        start = [ start, ones(1, dims-1) ];
-        count = size( mat );
+      spath = obj.ensure_leading_backslash( spath );
+      if ( obj.is_set(spath) && obj.readatt(spath, 'next_row') > 0 )
+        obj.unlink( spath );
       end
-      function make_container_set()
-        [data_sz, data_chunk] = get_sz_chunk( data );
-        [~, label_chunk] = get_sz_chunk( indices );
-        label_sz = Inf( 1, 2 );
-        h5create( obj.h5_file, data_set_path, data_sz, 'ChunkSize', data_chunk );
-        h5create( obj.h5_file, label_set_path, label_sz ...
-          , 'ChunkSize', label_chunk, 'FillValue', 0 );
+      obj.write_matrix_( mat, spath, 1 );
+    end
+    
+    function write_matrix_(obj, data, spath, start, varargin)
+      
+      %   WRITE_MATRIX_ -- Private function for writing numeric data to a
+      %     dataset at a given index.
+      %
+      %     The dataset will be created if it does not already exist.
+      %
+      %     IN:
+      %       - `data` (double) -- Matrix of data to write.
+      %       - `spath` (char) -- Path to the dataset.
+      %       - `start` (double) |SCALAR| -- Number specifying the row at
+      %         which to start writing data.
+      %       - `varargin` (cell) -- Additional inputs to optionally pass
+      %         to `create_set()` when createing a new set.
+      
+      if ( ~obj.is_set(spath) )
+        data_sz = size( data );
+        if ( isempty(varargin) )
+          obj.create_set( spath, [Inf, data_sz(2:end)] );
+        else
+          obj.create_set( spath, varargin{:} );
+        end
+        next_row = size( data, 1 ) + 1;
+      else next_row = start + size(data, 1);
       end
+      [start, count] = obj.get_start_count_( data, start );
+      h5write( obj.h5_file, spath, data, start, count );
+      obj.writeatt( spath, 'next_row', next_row );
+      obj.writeatt( spath, 'is_numeric', 1 );
+    end
+    
+    function add(obj, data, sgpath)
+      
+      %   ADD -- Append data to a given dataset or group of datasets.
+      %
+      %     Datasets will be created if they do not already exist.
+      %
+      %     IN:
+      %       - `data` (Container, double) -- Container object or numeric
+      %         matrix to save.
+      %       - `gname` (char) -- Group in which to save.
+      
+      if ( isa(data, 'Container') )
+        obj.add_container_( data, sgpath );
+      elseif ( isnumeric(data) || islogical(data) )
+        obj.add_matrix_( data, sgpath );
+      else
+        error( 'Unsupported data type ''%s''', class(data) );
+      end
+    end
+    
+    function add_container_(obj, container, gname)
+      
+      %   ADD_CONTAINER_ -- Private function for appending a Container to
+      %     an existing group.
+      
+      obj.assert__is_group( gname );
+      gname = obj.ensure_leading_backslash( gname );
+      data_set_path = [ gname, '/data' ];
+      if ( ~obj.is_set(data_set_path) )
+        next_row = 1;
+      else next_row = obj.readatt( data_set_path, 'next_row' );
+      end
+      obj.write_container_( container, gname, next_row );
+    end
+    
+    function add_matrix_(obj, data, spath)
+      
+      %   ADD_MATRIX_ -- Private function for appending data to an existing
+      %     dataset.
+      
+      spath = obj.ensure_leading_backslash( spath );
+      if ( ~obj.is_set(spath) )
+        next_row = 1;
+      else next_row = obj.readatt( spath, 'next_row' );
+      end
+      obj.write_matrix_( data, spath, next_row );
+    end
+    
+    %{
+        WRITE HELPERS
+    %}
+    
+    function chunk = get_chunk_(obj, sz)
+      
+      %   GET_CHUNK_ -- Get an appropriate chunk-size for a dataset.
+      %
+      %     IN:
+      %       - `sz` (double) -- Size vector.
+      %     OUT:
+      %       - `chunk` (double) -- 1xN vector of chunk-values, where each
+      %         `chunk`(i) corresponds to each `sz`(i).
+      
+      dims = numel( sz );
+      chunk = obj.CHUNK_SIZE( 1:dims );
+      chunk = min( [chunk; sz] );
+    end
+    
+    function [start, count] = get_start_count_(obj, mat, start)
+      
+      %   GET_START_COUNT_ -- Get appropriate start and count parameter
+      %     values given an incoming data matrix.
+      %
+      %     IN:
+      %       - `mat` (double) -- Data matrix
+      %       - `start` (double) |SCALAR| -- Number specifying the row at
+      %         which to starting writing data.
+      
+      dims = ndims( mat );
+      start = [ start, ones(1, dims-1) ];
+      count = size( mat );
     end
     
     function [new_indices, labs, cats] = ...
@@ -229,66 +397,91 @@ classdef h5_api < handle
       end
     end
     
-    function add(obj, container, gname)
+    %{
+        READ
+    %}
+    
+    function data = read(obj, sgpath)
       
-      %   ADD -- Append data in a Container object to a given group.
+      %   READ -- Load a Container object or matrix from the given path.
       %
-      %     A new dataset will be created if it does not already exist.
+      %     If the given path is to a group, it must be a group housing a
+      %     Container object. Otherwise, the given path must be to an
+      %     existing dataset, which will be read in its entirety.
       %
       %     IN:
-      %       - `container` (Container) -- Container object to save.
-      %       - `gname` (char) -- Group in which to save.
+      %       - `sgpath` (char) -- Path to the group housing /data and
+      %         /labels datasets, or to the dataset to read.
+      %     OUT:
+      %       - `data` (numeric, Container)
+      %   
       
-      obj.assert__isa( container, 'Container' );
-      obj.assert__is_group( gname );
-      gname = obj.ensure_leading_backslash( gname );
-      data_set_path = [ gname, '/data' ];
-      if ( ~obj.is_set(data_set_path) )
-        next_row = 1;
-      else next_row = h5readatt( obj.h5_file, data_set_path, 'next_row' );
+      sgpath = obj.ensure_leading_backslash( sgpath );
+      if ( obj.is_group(sgpath) )
+        data = obj.read_container_( sgpath );
+      else
+        obj.assert__is_set( sgpath );
+        is_num = obj.readatt( sgpath, 'is_numeric' );
+        if ( is_num )
+          data = obj.read_matrix_( sgpath );
+        else
+          error( 'Reading non-numeric data is not currently supported.' );
+        end
       end
-      obj.write_( container, gname, next_row );
     end
     
-    function cont = read(obj, gname)
+    function cont = read_container_(obj, gpath)
       
-      %   READ -- Load a Container from the given group.
+      %   READ_CONTAINER_ -- Read in a Container object from a given group.
       %
       %     IN:
-      %       - `gname` (char) -- Path to the group housing /data and
-      %         /labels datasets.
+      %       - `gpath` (char) -- Path to the group to read.
+      %     OUT:
+      %       - `cont` (Container) -- Loaded Container object.
       
-      obj.assert__is_group( gname );
-      gname = obj.ensure_leading_backslash( gname );
-      obj.assert__is_set( [gname, '/data'] );
-      labels = obj.read_labels_( gname );
-      
-      data = h5read( obj.h5_file, [gname, '/data'] );     
+      labels = obj.read_labels_( gpath );
+      obj.assert__is_set( [gpath, '/data'] );
+      data = h5read( obj.h5_file, [gpath, '/data'] );     
       cont = Container( data, labels );
+    end
+    
+    function data = read_matrix_(obj, spath)
+      
+      %   READ_MATRIX_ -- Read in a data matrix from a given dataset.
+      %
+      %     IN:
+      %       - `spath` (char) -- Path to the dataset to read.
+      %     OUT:
+      %       - `cont` (Container) -- Loaded Container object.
+      
+      obj.assert__is_set( spath );
+      data = h5read( obj.h5_file, spath );
     end
     
     function val = readatt(obj, sname, att)
       
-      %   READATT -- Read an attribute from a given dataset.
+      %   READATT -- Read an attribute from a given dataset or group.
       %
       %     IN:
-      %       - `sname` (char) -- Full path to the dataset.
+      %       - `sname` (char) -- Full path to the dataset or group.
       %       - `att` (char) -- Attribute to read.
       
-      obj.assert__is_set( sname );
+      sname = obj.ensure_leading_backslash( sname );
+      obj.assert__is_set_or_group( sname );
       val = h5readatt( obj.h5_file, sname, att );
     end
     
     function writeatt(obj, sname, att_name, att)
       
-      %   WRITEATT -- Write an attribute to a given dataset.
+      %   WRITEATT -- Write an attribute to a given dataset or group.
       %
       %     IN:
-      %       - `sname` (char) -- Full path to the dataset.
+      %       - `sname` (char) -- Full path to the dataset or group.
       %       - `att_name` (char) -- Name of the attribute to write to.
       %       - `att` (double, char) -- Value to write.
       
-      obj.assert__is_set( sname );
+      sname = obj.ensure_leading_backslash( sname );
+      obj.assert__is_set_or_group( sname );
       h5writeatt( obj.h5_file, sname, att_name, att );
     end
     
@@ -326,6 +519,24 @@ classdef h5_api < handle
       att = obj.decodeatt( sname, att );
     end
     
+    function rmatt(obj, sname, att)
+      
+      %   RMATT -- Remove an attribute from a dataset or group.
+      %
+      %     IN:
+      %       - `sname` (char) -- Path to the dataset or group.
+      %       - `att` (char) -- Attribute to delete.
+      
+      sname = obj.ensure_leading_backslash( sname );
+      obj.assert__is_set_or_group( sname );
+      obj.assert__is_attr( sname, att );
+      fid = H5F.open( obj.h5_file, 'H5F_ACC_RDWR','H5P_DEFAULT' );
+      gid = H5G.open( fid, sname );
+      H5A.delete( gid, att );
+      H5G.close( gid );
+      H5F.close( fid );
+    end
+    
     function labels = read_labels_(obj, gname)
       
       %   READ_LABELS_ -- Read labels from a given group.
@@ -355,12 +566,13 @@ classdef h5_api < handle
         
     function unlink(obj, sname)
       
-      %   UNLINK -- 'Delete' a dataset. Does not recover any space!
+      %   UNLINK -- Delete a group or dataset.
       %
       %     IN:
-      %       - `sname` (char) -- Path to the dataset to delete.
+      %       - `sname` (char) -- Path to the dataset or group to delete.
       
-      obj.assert__is_set( sname );
+      obj.assert__is_set_or_group( sname );
+      fileattrib( obj.h5_file, '+w' );
       fid = H5F.open( obj.h5_file, 'H5F_ACC_RDWR', 'H5P_DEFAULT' );
       H5L.delete( fid, sname, 'H5P_DEFAULT' );
       H5F.close(fid);
@@ -378,6 +590,18 @@ classdef h5_api < handle
       
       obj.assert__file_exists( filename, 'the .h5 file' );
       obj.h5_file = filename;
+    end
+    
+    function set.COMPRESSION_LEVEL(obj, val)
+      
+      %   SET.COMPRESSION_LEVEL -- Update the `COMPRESSION_LEVEL` property.
+      %
+      %     The incoming COMPRESSION_LEVEL must be a number between 0 and
+      %     9.
+      
+      assert( isscalar(val) && val <= 9 && val >= 0 ...
+        , 'Specify compression level as a number between 0 and 9.' );
+      obj.COMPRESSION_LEVEL = val;
     end
     
     function tf = is_set(obj, name)
@@ -476,8 +700,16 @@ classdef h5_api < handle
       %   ASSERT__IS_NOT_SET -- Ensure a given set does not already
       %     exist.
       
-      assert( obj.is_set(name), 'The specified dataset ''%s'' already exists.' ...
+      assert( ~obj.is_set(name), 'The specified dataset ''%s'' already exists.' ...
         , name );
+    end
+    
+    function assert__is_attr(obj, sname, att)
+      
+      %   ASSERT__IS_ATTR -- Ensure an attribute exists.
+      
+      assert( obj.is_attr(sname, att), ['The specified attribute ''%s''' ...
+        , ' does not exist.'], att );
     end
     
     function assert__h5_is_defined(obj)
@@ -511,6 +743,66 @@ classdef h5_api < handle
       h5disp( obj.h5_file, group_or_set );
     end
     
+    function overview(obj, group_or_set, n_tabs)
+      
+      %   OVERVIEW -- Display the structure of the .h5 file.
+      %
+      %     For datasets, only the size of the set is shown explicitly;
+      %     attribute names are listed, but their values are not displayed.
+      %
+      %     IN:
+      %       - `group_or_set` (char) |OPTIONAL| -- Path to the group
+      %         or set to display. Defaults to the root group '/'.
+      %       - `n_tabs` (double) |OPTIONAL| -- Sets the number of tabs to
+      %         prepend to the displayed string. Defaults to 0.
+      
+      if ( nargin < 2 ), group_or_set = '/'; n_tabs = 0; end;
+      if ( nargin < 3 ), n_tabs = 0; end;
+      info = h5info( obj.h5_file, group_or_set );
+      groups = info.Groups;
+      spc = '     ';
+      for i = 1:numel(groups)
+        grp = groups(i);
+        tabs = repmat( spc, 1, n_tabs );
+        tabs = [ '\n' tabs ];
+        split = strsplit( grp.Name, '/' );
+        to_print = sprintf( 'Group ''%s/''', split{end} );
+        fprintf( [tabs, to_print] );
+        if ( ~isempty(grp.Attributes) )
+          print_attrs( grp.Attributes, [tabs, spc] );
+        end
+        if ( ~isempty(grp.Datasets) )
+          sets = grp.Datasets;
+          tabs = [ tabs, spc ];
+          for k = 1:numel(sets)
+            fprintf( [tabs, 'Dataset ''%s'''], sets(k).Name );
+            attrs = sets(k).Attributes;
+            print_sz( sets(k).Dataspace.Size, 'Size', [tabs, spc] );
+            print_sz( sets(k).Dataspace.MaxSize, 'MaxSize', [tabs, spc] );
+            if ( isempty(attrs) ), continue; end;
+            print_attrs( attrs, [tabs, spc] );
+          end
+          fprintf( '\n' );
+        end
+        if ( ~isempty(grp.Groups) )
+          obj.overview( grp.Name, n_tabs+1 );
+        end
+      end
+      function print_attrs( attrs, spc )
+        attrs_array = cell( 1, numel(attrs) );
+        for j = 1:numel(attrs)
+          attrs_array{j} = sprintf( '"%s"', attrs(j).Name );
+        end
+        attrs_char = strjoin( attrs_array, ', ' );
+        fprintf( [spc, 'Attributes: %s'], attrs_char );
+      end
+      function print_sz( sz, kind, spc )
+        sz = arrayfun( @(x) num2str(x), sz, 'un', false );
+        sz = [ '[', strjoin(sz, ' '), ']' ];
+        fprintf( [spc, '%s: %s'], kind, sz );
+      end
+    end
+    
     function snames = get_set_names(obj, gname)
       
       %   GET_SET_NAMES -- Return an array of dataset names in the given
@@ -539,7 +831,7 @@ classdef h5_api < handle
       %       - `anames` (cell array of strings, {})
       
       sname = obj.ensure_leading_backslash( sname );
-      obj.assert__is_set( sname );
+      obj.assert__is_set_or_group( sname );
       info = h5info( obj.h5_file, sname );
       anames = {};
       if ( isempty(info.Attributes) ), return; end;
