@@ -578,6 +578,84 @@ classdef h5_api < handle
       H5F.close(fid);
     end
     
+    function remove(obj, selectors, gpath)
+      
+      %   REMOVE -- Remove values from a Container group associated with
+      %     the given selectors.
+      %
+      %     IN:
+      %       - `selectors` (cell array of strings, char)
+      %       - `gpath` (char) -- Path to the Container group.
+      
+      gpath = obj.ensure_leading_backslash( gpath );
+      obj.assert__is_group( gpath );
+      
+      labs = obj.read_labels_( gpath );
+      [labs, ind] = labs.remove( selectors );
+      if ( ~any(ind) )
+        fprintf( '\n No data matched the given selectors ...' );
+        return;
+      end      
+      cont = obj.read_container_( gpath );
+      cont = cont.keep( ~ind );      
+      obj.write_container( cont, gpath );
+    end
+    
+    function rebuild(obj)
+      
+      %   REBUILD -- Copy the datasets in the .h5 file to a new .h5 file.
+      %
+      %     When data in a dataset or group is overwritten, the space eaten
+      %     up by the overwritten data is not reclaimed. Rather, the "link"
+      %     to the data is overwritten; the data still resides in the file,
+      %     but the path to that data is lost. rebuild() copies each
+      %     link to a new .h5 file, such that only the linked data is
+      %     retained. This reclaims storage space.
+      
+      obj.assert__file_exists( obj.h5_file );
+      does_exist = true;
+      i = 1;
+      while ( does_exist )
+        tmp_filename = sprintf( '%s.tmp%d', obj.h5_file, i );
+        i = i + 1;
+        does_exist = obj.file_exists( tmp_filename );
+      end
+      obj.create( tmp_filename );
+      fileattrib( tmp_filename, '+w' );
+      fileattrib( obj.h5_file, '+w' );
+      ocpl = H5P.create( 'H5P_OBJECT_COPY' );
+      lcpl = H5P.create( 'H5P_LINK_CREATE' );
+      H5P.set_create_intermediate_group( lcpl, true );
+      fid = H5F.open( obj.h5_file, 'H5F_ACC_RDWR', 'H5P_DEFAULT' );
+      fid_tmp = H5F.open( tmp_filename, 'H5F_ACC_RDWR', 'H5P_DEFAULT' );
+      
+      info = h5info( obj.h5_file );
+      groups = { info.Groups(:).Name };
+      
+      for i = 1:numel(groups)
+        copy_one_group( groups{i} );
+      end
+      
+      H5F.close( fid );
+      H5F.close( fid_tmp );
+      
+      delete( obj.h5_file );
+      movefile( tmp_filename, obj.h5_file );
+      
+      function copy_one_group( gname )
+        
+        %   COPY_ONE_GROUP -- Copy a subgroup to the new file.
+        
+        gid = H5G.open( fid, gname );
+        gid_tmp = H5G.open( fid_tmp, '/' );
+        H5O.copy( gid, gname, gid_tmp, gname, ocpl, lcpl );
+        H5G.close( gid );
+        H5G.close( gid_tmp );
+        H5P.close( ocpl );
+        H5P.close( lcpl );
+      end
+    end
+    
     %{
         PROPERTY VALIDATION
     %}
