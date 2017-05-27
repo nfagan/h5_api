@@ -10,7 +10,7 @@ classdef h5_api < handle
     
     function obj = h5_api(filename)
       
-      %   DSP_H5 -- Instantiate an interface to a .h5 database file.
+      %   H5_API -- Instantiate an interface to a .h5 database file.
       %
       %     An error is thrown if the given database file is not found.
       %
@@ -131,8 +131,14 @@ classdef h5_api < handle
       
       if ( isa(data, 'Container') )
         obj.write_container( data, sgpath );
-      elseif ( isnumeric(data) )
+      elseif ( isnumeric(data) || islogical(data) )
         obj.write_matrix( data, sgpath );
+      elseif ( iscellstr(data) )
+        obj.write_cellstr( data, sgpath );
+      elseif ( isstruct(data) )
+        obj.write_struct( data, sgpath );
+      elseif ( ischar(data) )
+        obj.write_char( data, sgpath );
       else
         error( 'Unsupported data type ''%s''', class(data) );
       end
@@ -150,15 +156,15 @@ classdef h5_api < handle
       %       - `container` (Container) -- Container object to save.
       %       - `gname` (char) -- Path to the group in which to save.
       
-      obj.assert__is_group( gname );
-      gname = obj.ensure_leading_backslash( gname );
-      
-      data_set_path = [ gname, '/data' ];
-      label_set_path = [ gname, '/labels' ];
-      
-      if ( obj.is_set(data_set_path) ), obj.unlink( data_set_path ); end
-      if ( obj.is_set(label_set_path) ), obj.unlink( label_set_path ); end
-      
+      if ( ~obj.is_group(gname) ), obj.create_group( gname ); end
+      gname = obj.ensure_leading_backslash( gname );      
+      snames = { 'data', 'labels', 'indices', 'categories' };
+      for i = 1:numel(snames)
+        full_sname = sprintf( '%s/%s', gname, snames{i} );
+        if ( obj.is_set(full_sname) )
+          obj.unlink( full_sname );
+        end
+      end      
       obj.write_container_( container, gname, 1 );
     end
     
@@ -168,7 +174,9 @@ classdef h5_api < handle
       %     object to an extensible dataset, starting from a given row.
       
       data_set_path = [ gname, '/data' ];
-      label_set_path = [ gname, '/labels' ];
+      indices_path = [ gname, '/indices' ];
+      label_path = [ gname, '/labels' ];
+      cat_path = [ gname, '/categories' ];
       
       if ( ~isa(container.labels, 'SparseLabels') )
         container = container.sparse();
@@ -182,22 +190,37 @@ classdef h5_api < handle
       
       if ( ~obj.is_set(data_set_path) )
         obj.write_matrix_( data, data_set_path, 1 );
-        obj.write_matrix_( indices, label_set_path, 1, [Inf, Inf], [] ...
+        obj.write_matrix_( indices, indices_path, 1, [Inf, Inf], [] ...
           , 'FillValue', 0 );
       else
-        [indices, labs, categories] = ...
-          obj.match_( label_set_path, indices, labs, categories );
+        incoming.indices = indices;
+        incoming.labels = labs;
+        incoming.categories = categories;
+        
+        existing.labels = obj.read( label_path );
+        existing.categories = obj.read( cat_path );
+        
+        %   match format of already-stored labels
+        [indices, labs, categories] = obj.match_( existing, incoming );
+        
         obj.write_matrix_( data, data_set_path, start );
-        obj.write_matrix_( indices, label_set_path, start );
+        obj.write_matrix_( indices, indices_path, start );
       end
       
-      categories = json( 'encode', categories );
-      labs = json( 'encode', labs );
+      obj.write( labs, label_path );
+      obj.write( categories, cat_path );
       
-      obj.writeatt( label_set_path, 'categories', categories );
-      obj.writeatt( label_set_path, 'labels', labs );
-      obj.writeatt( data_set_path, 'class', class(container) );
-      obj.writeatt( gname, 'class', class(container) );
+      obj.writeatt( data_set_path, 'class', 'Container' );
+      obj.writeatt( gname, 'class', 'Container' );
+      
+      if ( isequal(class(container), 'Container') )
+        subclass = '';
+      else
+        subclass = class(container);
+      end
+      
+      obj.writeatt( data_set_path, 'subclass', subclass );
+      obj.writeatt( gname, 'subclass', subclass );
     end
     
     function write_matrix(obj, mat, spath)
@@ -206,7 +229,7 @@ classdef h5_api < handle
       %     current contents.
       %
       %     IN:
-      %       - `mat` (double, uint8) -- Data matrix to save.
+      %       - `mat` (double, uint8, logical) -- Data matrix to save.
       %       - `spath` (char) -- Path to the dataset in which to save. The
       %         set will be created if it does not exist.
       
@@ -230,7 +253,7 @@ classdef h5_api < handle
       %       - `start` (double) |SCALAR| -- Number specifying the row at
       %         which to start writing data.
       %       - `varargin` (cell) -- Additional inputs to optionally pass
-      %         to `create_set()` when createing a new set.
+      %         to `create_set()` when creating a new set.
       
       if ( ~obj.is_set(spath) )
         data_sz = size( data );
@@ -243,9 +266,124 @@ classdef h5_api < handle
       else next_row = start + size(data, 1);
       end
       [start, count] = obj.get_start_count_( data, start );
+      if ( islogical(data) )
+        is_logical = 1;
+        data = double( data );
+      else
+        is_logical = 0;
+      end
       h5write( obj.h5_file, spath, data, start, count );
-      obj.writeatt( spath, 'next_row', next_row );
       obj.writeatt( spath, 'is_numeric', 1 );
+      obj.writeatt( spath, 'next_row', next_row );
+      obj.writeatt( spath, 'is_logical', is_logical );
+    end
+    
+    function write_cellstr(obj, data, spath)
+      
+      %   WRITE_CELLSTR -- Write a 1-d cell-array of strings to a dataset,
+      %     erasing the current contents.
+      %
+      %     Note that cell arrays are not currently extensible.
+      %
+      %     The bulk of this code was plagiarized from
+      %     'HDF5_vlen_string_example.m'
+      %
+      %     IN:
+      %       - `data` (1-d cell array of strings)
+      %       - `spath` (char)
+      
+      obj.assert__iscellstr( data );
+      obj.assert__file_exists( obj.h5_file );
+      assert( isvector(data), ['If writing a cell array of strings,' ...
+        , ' the array must be a vector.'] );
+      
+      if ( obj.is_set(spath) ), obj.unlink( spath ); end;
+      
+      spath = obj.ensure_leading_backslash( spath );
+      components = obj.path_components( spath );
+      
+      if ( numel(components) == 0 )
+        error( 'The dataset name ''/'' is reserved and invalid.' );
+      elseif ( numel(components) > 1 )
+        gname = strjoin( components(1:end-1), '/' );
+        sname = components{end};
+      else
+        gname = '/';
+        sname = components{end};
+      end
+      if ( ~obj.is_group(gname) )
+        obj.create_group( gname );
+      end
+      fileattrib( obj.h5_file,'+w' );
+      fid = H5F.open( obj.h5_file, 'H5F_ACC_RDWR', 'H5P_DEFAULT' );
+      loc_id = H5G.open( fid, gname );
+      VLstr_type = H5T.copy( 'H5T_C_S1' );
+      H5T.set_size( VLstr_type, 'H5T_VARIABLE' );
+      % Create a dataspace for cellstr
+      H5S_UNLIMITED = H5ML.get_constant_value( 'H5S_UNLIMITED'  );
+      dspace = H5S.create_simple( 1, numel(data), H5S_UNLIMITED );
+      % Create a dataset plist for chunking
+      plist = H5P.create( 'H5P_DATASET_CREATE' );
+      H5P.set_chunk( plist, 2 ); % 2 strings per chunk
+      % Create dataset
+      dset = H5D.create( loc_id, sname, VLstr_type, dspace, plist );
+      % Write data
+      H5D.write( dset, VLstr_type, 'H5S_ALL', 'H5S_ALL', 'H5P_DEFAULT', data );
+      % Close file & resources
+      H5P.close( plist );
+      H5T.close( VLstr_type );
+      H5S.close( dspace );
+      H5D.close( dset );
+      H5G.close( loc_id );
+      H5F.close( fid );
+      % Indicate that this is a cell array of strings
+      obj.writeatt( spath, 'class', 'cellstr' );
+      obj.writeatt( spath, 'is_numeric', 0 );
+      obj.writeatt( spath, 'is_char', 0 );
+    end
+    
+    function write_struct(obj, data, sgpath)
+      
+      %   WRITE_STRUCT -- Write a scalar struct to the specified group.
+      %
+      %     IN:
+      %       - `sgpath` (char) -- Path to the group / set in which to
+      %       save.
+      
+      obj.assert__isa( data, 'struct', 'the struct data' );
+      assert( isscalar(data), 'The struct must be scalar.' );
+      if ( obj.is_set(sgpath) || obj.is_group(sgpath) )
+        obj.unlink( sgpath );
+      end
+      obj.create_group( sgpath );
+      obj.writeatt( sgpath, 'class', 'struct' );
+      obj.writeatt( sgpath, 'is_numeric', 0 );
+      fields = fieldnames( data );
+      for i = 1:numel( fields )
+        current = data.(fields{i});
+        full_path = sprintf( '%s/%s', sgpath, fields{i} );
+        try 
+          obj.write( current, full_path );
+        catch err
+          fprintf( ['\nThe following error occurred when attempting' ...
+            , ' to save struct-data:'] );
+          rethrow( err );
+        end
+      end
+    end
+    
+    function write_char(obj, data, sgpath)
+      
+      %   WRITE_CHAR -- Write a character array to a given dataset.
+      %
+      %     IN:
+      %       - `data` (char)
+      %       - `sgpath` (char) -- Path to the dataset.
+      
+      obj.assert__isa( data, 'char', 'the char data' );
+      data = { data };
+      obj.write( data, sgpath );
+      obj.writeatt( sgpath, 'is_char', 1 );
     end
     
     function add(obj, data, sgpath)
@@ -330,37 +468,32 @@ classdef h5_api < handle
       count = size( mat );
     end
     
-    function [new_indices, labs, cats] = ...
-        match_(obj, label_set_path, indices, labels, categories)
+    function [new_indices, labs, cats] = match_(obj, existing, incoming)
       
       %   MATCH_ -- Private function for rearranging the indices, labels,
       %     and categories of an incoming Container object to match the
       %     format of the already-stored values.
       %
-      %     `match_()` reads the categories and labels attributes of the
-      %     current labels dataset. Incoming labels, categories, and
-      %     indices are rearranged such that, for labels shared between
-      %     incoming and current datasets, the incoming indices are
-      %     appended to the correct column of the current indices.
+      %     Incoming labels, categories, and indices are rearranged such 
+      %     that, for labels shared between incoming and current datasets, 
+      %     the incoming indices are appended to the correct column of the 
+      %     current indices.
       %
       %     IN:
-      %       - `label_set_path` (char) -- Path to the labels dataset to
-      %         match.
-      %       - `indices` (double) -- Array of indices, converted from
-      %         sparse logical.
-      %       - `labels` (cell array of strings)
-      %       - `categories` (cell array of strings)
+      %       - `existing` (struct) -- struct containing the existing
+      %         'categories' and 'labels'
+      %       - `incoming` (struct) -- struct containing the incoming
+      %         'categories', 'labels', and 'indices'
       %     OUT:
       %       - `new_indices` (double)
       %       - `labs` (cell array of strings)
       %       - `cats` (cell array of strings)
       
-      current_cats = json( 'parse', obj.readatt(label_set_path, 'categories') );
-      current_labels = json( 'parse', obj.readatt(label_set_path, 'labels') );
-      current_cats = current_cats(:);
-      current_labels = current_labels(:);
-      labels = labels(:);
-      categories = categories(:);
+      current_cats =    existing.categories(:);
+      current_labels =  existing.labels(:);
+      categories =      incoming.categories(:);
+      labels =          incoming.labels(:);
+      indices =         incoming.indices;
       
       assert( isequal(unique(current_cats), unique(categories)) ...
         , ['The categories must match between the stored object and' ...
@@ -401,31 +534,80 @@ classdef h5_api < handle
         READ
     %}
     
-    function data = read(obj, sgpath)
+    function data = read(obj, sgpath, varargin)
       
-      %   READ -- Load a Container object or matrix from the given path.
+      %   READ -- Load a Container object, matrix, struct, or cell array
+      %     of strings from the given path.
       %
-      %     If the given path is to a group, it must be a group housing a
-      %     Container object. Otherwise, the given path must be to an
-      %     existing dataset, which will be read in its entirety.
+      %     data = obj.read( '/ex' );
+      %     where '/ex' is a path to a dataset called 'ex' loads the
+      %     entire contents of 'ex'. 'ex' can be a double or logical matrix 
+      %     / n-d array, or a cell array of strings.
+      %
+      %     data = obj.read( '/ex', index );
+      %     instead loads rows of '/ex' at which `index` is true. In this
+      %     case, 'ex' must be a double or logical matrix / n-d array.
+      %
+      %     data = obj.read( '/ex' );
+      %     where '/ex' is a path to a group called 'ex' loads the entire
+      %     contents of 'ex' according to the class of object stored in
+      %     'ex'. If the 'class' attribute of 'ex' is struct, `data` is a
+      %     struct. Otherwise, `data` is a Container object.
+      %
+      %     data = obj.read( '/ex', selector_type, selectors );
+      %     where '/ex' is a path to a Container object group called 'ex'
+      %     loads the subset of data in 'ex' associated with the given
+      %     `selectors` and `selector_type`.
+      %
+      %     E.g., data = obj.read( '/ex', 'only', {'05/17/2017'} ) loads
+      %     only the data associated with the label '05/17/2017'. Valid 
+      %     selector types are 'only', 'only not', and 'except'.
       %
       %     IN:
       %       - `sgpath` (char) -- Path to the group housing /data and
       %         /labels datasets, or to the dataset to read.
+      %       - `varargin` (cell array) |OPTIONAL| -- Index, or selector 
+      %         type / selectors.
       %     OUT:
       %       - `data` (numeric, Container)
-      %   
       
       sgpath = obj.ensure_leading_backslash( sgpath );
+      addtl_inputs_given = ~isempty( varargin );
+      err_msg = [ 'Too many input arguments; Can only specify selectors' ...
+        , ' if the given path is to a Container group.' ];
       if ( obj.is_group(sgpath) )
-        data = obj.read_container_( sgpath );
+        kind = obj.readatt( sgpath, 'class' );
+        switch ( kind )
+          case 'Container'
+            if ( ~addtl_inputs_given )
+              data = obj.read_container_( sgpath );
+            else
+              data = obj.read_container_selected_( sgpath, varargin{:} );
+            end
+          case 'struct'
+            assert( ~addtl_inputs_given, err_msg );
+            data = obj.read_struct_( sgpath );
+          otherwise
+            error( ['Reading data of class ''%s'' is not currently' ...
+              , ' supported.'], kind );
+        end
       else
         obj.assert__is_set( sgpath );
         is_num = obj.readatt( sgpath, 'is_numeric' );
         if ( is_num )
-          data = obj.read_matrix_( sgpath );
+          data = obj.read_matrix_( sgpath, varargin{:} );
         else
-          error( 'Reading non-numeric data is not currently supported.' );
+          assert( ~addtl_inputs_given, err_msg );
+          kind = obj.readatt( sgpath, 'class' );
+          switch ( kind )
+            case 'cellstr'
+              data = obj.read_cellstr_( sgpath );
+              is_char = obj.readatt( sgpath, 'is_char' );
+              if ( is_char ), data = char( data ); end;
+            otherwise
+              error( ['Reading data of class ''%s'' is not currently' ...
+                , ' supported.'], kind );
+          end
         end
       end
     end
@@ -440,22 +622,182 @@ classdef h5_api < handle
       %       - `cont` (Container) -- Loaded Container object.
       
       labels = obj.read_labels_( gpath );
-      obj.assert__is_set( [gpath, '/data'] );
-      data = h5read( obj.h5_file, [gpath, '/data'] );     
+      data = obj.read( [gpath, '/data'] );
       cont = Container( data, labels );
     end
     
-    function data = read_matrix_(obj, spath)
+    function [cont, ind] = read_container_selected_(obj, gpath, selector_type, selectors)
+      
+      %   READ_CONTAINER_SELECTED_ -- Read a subset of the data in a
+      %     Container group associated with the specified selectors and
+      %     selector type.
+      %
+      %     IN:
+      %       - `gpath` (char) -- Path to the Container-housing group.
+      %       - `selector_type` (char) -- 'only', 'only_not', or 'exclude'
+      %       - `selectors` (cell array of strings, char) -- Labels to
+      %         select.     
+      %     OUT:
+      %       - `cont` (Container) -- Loaded Container object.
+      %       - `ind` (logical) -- Index used to select rows for `cont`.
+      
+      labels = obj.read_labels_( gpath );
+      ind = obj.get_index_of_selectors( labels, selector_type, selectors );
+      assert( any(ind), 'No data matched the given criteria.' );
+      data = obj.read_matrix_rows_at_index( ind, [gpath, '/data'] );
+      labels = labels.keep( ind );
+      cont = Container( data, labels );
+    end
+    
+    function data = read_matrix_rows_at_index(obj, ind, sname)
+      
+      %   READ_MATRIX_ROWS_AT_INDICES -- Read rows of data at which `ind`
+      %     is true.
+      %
+      %     IN:
+      %       - `ind` (logical) -- 1-column matrix specifying elements to
+      %         read.
+      %       - `sname` (char) -- Path to the dataset to read.
+      
+      obj.assert__is_set( sname );
+      sname = obj.ensure_leading_backslash( sname );
+      inds = obj.find_contiguous_indices( ind );
+      starts = inds(:, 1);
+      counts = inds(:, 2) - inds(:, 1);
+      sz = obj.get_set_size( sname );
+      dims = numel( sz );
+      addtl = ones( 1, dims-1 );
+      n_rows = sum( ind );
+      data = zeros( [n_rows, sz(2:end)] );
+      colons = repmat( {':'}, 1, dims-1 );
+      stp = 1;
+      for i = 1:numel(starts)
+        start = [ starts(i), addtl ];
+        count = [ counts(i), sz(2:end) ];
+        some_data = obj.read( sname, start, count );
+        data( stp:stp+count(1)-1, colons{:} ) = some_data;
+        stp = stp + count(1);
+      end
+    end
+    
+    function inds = find_contiguous_indices(obj, inds)
+      
+      %   FIND_CONTIGUOUS_INDICES -- Locate the start and stop points of
+      %   	contiguous sequences of logical true values.
+      %
+      %     IN:
+      %       - `inds` (double)
+      
+      obj.assert__isa( inds, 'logical', 'the indices' );
+      if ( issparse(inds) ), inds = full( inds ); end;
+      inds = inds(:);
+      diffed = diff( inds );
+      starts = find( diffed == 1 ) + 1;
+      ends = find( diffed == -1 ) + 1;
+      if ( inds(1) )
+        starts = [ 1; starts ]; 
+      end
+      if ( inds(end) )
+        ends = [ ends; numel(inds)+1 ]; 
+      end
+      assert( numel(starts) == numel(ends), 'Starts did not match ends.' );
+      assert( sum(ends-starts) == sum(inds), 'Counts did not match.' );
+      inds = [ starts, ends ];
+    end
+    
+    function ind = get_index_of_selectors(obj, labels, selector_type, selectors)
+      
+      %   GET_INDEX_OF_SELECTORS -- Determine which elements of a Container
+      %     object to select.
+      %
+      %     IN:
+      %       - `labels` (SparseLabels) -- Constructed SparseLabels object.
+      %       - `selector_type` (char) -- 'only', 'only_not', or 'exclude'
+      %       - `selectors` (cell array of strings, char) -- Labels to
+      %         select.
+      
+      obj.assert__isa( selector_type, 'char', 'the selector type' );
+      if ( ~iscell(selectors) ), selectors = { selectors }; end;
+      obj.assert__iscellstr( selectors, 'the selectors' );
+      obj.assert__isa( labels, 'SparseLabels', 'the the labels object' );
+      
+      switch ( selector_type )
+        case 'only'
+          ind = labels.where( selectors );
+        case {'only_not', 'only not'}
+          ind = ~labels.where( selectors );
+        case 'except'
+          [~, ind] = labels.remove( selectors );
+          ind = ~ind;
+        otherwise
+          error( 'Unrecognized selector type ''%s''', selector_type );
+      end
+    end
+    
+    function data = read_matrix_(obj, spath, start, count)
       
       %   READ_MATRIX_ -- Read in a data matrix from a given dataset.
       %
       %     IN:
       %       - `spath` (char) -- Path to the dataset to read.
+      %       - `start` (double) |OPTIONAL| -- Where in the dataset to
+      %         start reading.
+      %       - `count` (double) |OPTIONAL| -- Number of elements to read
+      %         along each dimension.
       %     OUT:
-      %       - `cont` (Container) -- Loaded Container object.
+      %       - `data` (double, logical) -- Loaded matrix.
       
       obj.assert__is_set( spath );
-      data = h5read( obj.h5_file, spath );
+      if ( nargin < 4 )
+        narginchk( 2, 2 );
+        data = h5read( obj.h5_file, spath );
+      else
+        data = h5read( obj.h5_file, spath, start, count );
+      end
+      is_logical = obj.readatt( spath, 'is_logical' );
+      if ( is_logical ), data = logical( data ); end
+    end
+    
+    function data = read_cellstr_(obj, spath)
+      
+      %   READ_CELLSTR_ -- Read in a cell array of strings from a given
+      %     dataset.
+      %
+      %     IN:
+      %       - `spath` (char) -- Path to the dataset to read.
+      
+      obj.assert__is_set( spath );
+      obj.assert__file_exists( obj.h5_file );
+      fid = H5F.open( obj.h5_file, 'H5F_ACC_RDONLY', 'H5P_DEFAULT' );
+      VLstr_type = H5T.copy( 'H5T_C_S1' );
+      H5T.set_size( VLstr_type, 'H5T_VARIABLE' );
+      dset = H5D.open( fid, spath );
+      data = H5D.read( dset, VLstr_type, 'H5S_ALL' ...
+        , 'H5S_ALL', 'H5P_DEFAULT' );
+      H5T.close( VLstr_type );
+      H5D.close( dset);
+      H5F.close( fid );
+    end
+    
+    function data = read_struct_(obj, sgpath)
+      
+      %   READ_STRUCT_ -- Read in a struct from a given struct-group.
+      %
+      %     IN:
+      %       - `sgpath` (char) -- Path to the struct-to-read.
+      
+      assert( obj.is_struct_group(sgpath), ['The path ''%s'' is not' ...
+        , ' to a struct.'], sgpath );
+      sets = obj.get_set_names( sgpath );
+      grps = obj.get_group_names( sgpath );
+      split = cellfun( @(x) obj.path_components(x), grps, 'un', false );
+      grps = cellfun( @(x) x{end}, split, 'un', false );
+      all_to_read = [ sets(:); grps(:) ];
+      for i = 1:numel(all_to_read)
+        full_set = sprintf( '%s/%s', sgpath, all_to_read{i} );
+        field = obj.read( full_set );
+        data.(all_to_read{i}) = field;
+      end
     end
     
     function val = readatt(obj, sname, att)
@@ -483,40 +825,6 @@ classdef h5_api < handle
       sname = obj.ensure_leading_backslash( sname );
       obj.assert__is_set_or_group( sname );
       h5writeatt( obj.h5_file, sname, att_name, att );
-    end
-    
-    function encodeatt(obj, sname, att_name, att)
-      
-      %   ENCODEATT -- Write an attribute to a given dataset, after
-      %     encoding it to a JSON string.
-      %
-      %     IN:
-      %       - `sname` (char) -- Full path to the dataset.
-      %       - `att_name` (char) -- Name of the attribute to write to.
-      %       - `att` (double, char) -- Value to write.
-      
-      att = json( 'encode', att );
-      obj.writeatt( sname, att_name, att );
-    end
-    
-    function att = decodeatt(obj, sname, att)
-      
-      %   DECODEATT -- Read an attribute from a given dataset, and parse it
-      %     into a Matlab variable.
-      %
-      %     IN:
-      %       - `sname` (char) -- Full path to the dataset.
-      %       - `att` (char) -- Attribute to read.
-      
-      att = obj.readatt( sname, att );
-      att = json( 'parse', att );
-    end
-    
-    function att = parseatt(obj, sname, att)
-      
-      %   PARSEATT -- Alias for `decodeatt()`.
-      
-      att = obj.decodeatt( sname, att );
     end
     
     function rmatt(obj, sname, att)
@@ -547,21 +855,18 @@ classdef h5_api < handle
       %     OUT:
       %       - `labs` (SparseLabels) -- Constructed SparseLabels object.
       
-      gname = [ gname, '/labels' ];
-      obj.assert__is_set( gname );
-      indices = h5read( obj.h5_file, gname );
-      categories = h5readatt( obj.h5_file, gname, 'categories' );
-      labs = h5readatt( obj.h5_file, gname, 'labels' );
+      snames = { 'labels', 'indices', 'categories' };
       
-      categories = json( 'parse', categories );
-      categories = categories(:);
-      labs = json( 'parse', labs );
-      labs = labs(:);
+      cellfun( @(x) obj.assert__is_set([gname, '/', x]), snames );
+      
+      indices =     obj.read( [gname, '/indices'] );
+      labs =        obj.read( [gname, '/labels'] );
+      categories =  obj.read( [gname, '/categories'] );
       
       labels = SparseLabels();
-      labels.labels = labs;
-      labels.categories = categories;
-      labels.indices = sparse( logical(indices) );      
+      labels.labels = labs(:);
+      labels.categories = categories(:);
+      labels.indices = sparse( indices );      
     end
         
     function unlink(obj, sname)
@@ -591,7 +896,7 @@ classdef h5_api < handle
       obj.assert__is_group( gpath );
       
       labs = obj.read_labels_( gpath );
-      [labs, ind] = labs.remove( selectors );
+      [~, ind] = labs.remove( selectors );
       if ( ~any(ind) )
         fprintf( '\n No data matched the given selectors ...' );
         return;
@@ -612,40 +917,43 @@ classdef h5_api < handle
       %     link to a new .h5 file, such that only the linked data is
       %     retained. This reclaims storage space.
       
-      obj.assert__file_exists( obj.h5_file );
+      current_h5 = obj.h5_file;
+      obj.assert__file_exists( current_h5 );
       does_exist = true;
       i = 1;
       while ( does_exist )
-        tmp_filename = sprintf( '%s.tmp%d', obj.h5_file, i );
+        tmp_filename = sprintf( '%s.tmp%d', current_h5, i );
         i = i + 1;
         does_exist = obj.file_exists( tmp_filename );
       end
       obj.create( tmp_filename );
       fileattrib( tmp_filename, '+w' );
-      fileattrib( obj.h5_file, '+w' );
-      ocpl = H5P.create( 'H5P_OBJECT_COPY' );
-      lcpl = H5P.create( 'H5P_LINK_CREATE' );
-      H5P.set_create_intermediate_group( lcpl, true );
-      fid = H5F.open( obj.h5_file, 'H5F_ACC_RDWR', 'H5P_DEFAULT' );
+      fileattrib( current_h5, '+w' );
+      fid = H5F.open( current_h5, 'H5F_ACC_RDWR', 'H5P_DEFAULT' );
       fid_tmp = H5F.open( tmp_filename, 'H5F_ACC_RDWR', 'H5P_DEFAULT' );
       
-      info = h5info( obj.h5_file );
-      groups = { info.Groups(:).Name };
+      info = h5info( current_h5 );
       
-      for i = 1:numel(groups)
-        copy_one_group( groups{i} );
+      if ( numel(info.Groups > 0) )        
+        groups = { info.Groups(:).Name };
+        for i = 1:numel(groups)
+          copy_one_group( groups{i} );
+        end
       end
-      
+
       H5F.close( fid );
       H5F.close( fid_tmp );
       
-      delete( obj.h5_file );
-      movefile( tmp_filename, obj.h5_file );
+      delete( current_h5 );
+      movefile( tmp_filename, current_h5 );
       
       function copy_one_group( gname )
         
         %   COPY_ONE_GROUP -- Copy a subgroup to the new file.
         
+        ocpl = H5P.create( 'H5P_OBJECT_COPY' );
+        lcpl = H5P.create( 'H5P_LINK_CREATE' );
+        H5P.set_create_intermediate_group( lcpl, true );
         gid = H5G.open( fid, gname );
         gid_tmp = H5G.open( fid_tmp, '/' );
         H5O.copy( gid, gname, gid_tmp, gname, ocpl, lcpl );
@@ -738,6 +1046,48 @@ classdef h5_api < handle
       end
     end
     
+    function tf = is_struct_group(obj, name)
+      
+      %   IS_STRUCT_GROUP -- Return whether the given path is to a group
+      %     housing a struct.
+      %
+      %     IN:
+      %       - `name` (char)
+      %     OUT:
+      %       - `tf` (logical) |SCALAR|
+      
+      obj.assert__isa( name, 'char', 'the group name' );
+      name = obj.ensure_leading_backslash( name );
+      tf = false;
+      try
+        kind = obj.readatt( name, 'class' );
+        tf = strcmp( kind, 'struct' );
+      catch
+        return;
+      end
+    end
+    
+    function tf = is_container_group(obj, name)
+      
+      %   IS_CONTAINER_GROUP -- Return whether the given path is to a group
+      %     housing a Container object.
+      %
+      %     IN:
+      %       - `name` (char)
+      %     OUT:
+      %       - `tf` (logical) |SCALAR|
+      
+      obj.assert__isa( name, 'char', 'the group name' );
+      name = obj.ensure_leading_backslash( name );
+      tf = false;
+      try
+        kind = obj.readatt( name, 'class' );
+        tf = strcmp( kind, 'Container' );
+      catch
+        return;
+      end
+    end
+    
     function assert__is_set(obj, name)
       
       %   ASSERT__IS_SET -- Ensure a dataset exists.
@@ -773,6 +1123,15 @@ classdef h5_api < handle
         , name );
     end
     
+    function assert__is_container_group(obj, gpath)
+      
+      %   ASSERT__IS_CONTAINER_GROUP -- Ensure a given path is to a
+      %     Container group.
+      
+      assert( obj.is_container_group(gpath), ['The specified path ''%s''' ...
+        , ' does not house a Container object.'], gpath );
+    end
+    
     function assert__is_not_set(obj, name)
       
       %   ASSERT__IS_NOT_SET -- Ensure a given set does not already
@@ -804,6 +1163,23 @@ classdef h5_api < handle
         UTIL
     %}
     
+    function disp(obj)
+      
+      %   DISP -- Overloaded display.
+      
+      if ( ~any(isnan(obj.h5_file)) && obj.file_exists(obj.h5_file) )
+        fprintf( '\n%s connected to ''%s'' with file structure:\n' ...
+          , class(obj), obj.h5_file );
+        obj.overview();
+        fprintf( '\n\n' );
+      elseif ( isnan(obj.h5_file) )
+        fprintf( '\n%s with no defined .h5 file\n\n\n', class(obj) );
+      else
+        fprintf( '\n%s associated with the unknown file ''%s''\n\n\n' ...
+          , class(obj), obj.h5_file );
+      end
+    end
+    
     function list(obj, group_or_set)
       
       %   LIST -- Display the contents of part or all of the current .h5
@@ -821,7 +1197,7 @@ classdef h5_api < handle
       h5disp( obj.h5_file, group_or_set );
     end
     
-    function overview(obj, group_or_set, n_tabs)
+    function overview(obj, group_or_set, n_tabs, display_children)
       
       %   OVERVIEW -- Display the structure of the .h5 file.
       %
@@ -834,22 +1210,38 @@ classdef h5_api < handle
       %       - `n_tabs` (double) |OPTIONAL| -- Sets the number of tabs to
       %         prepend to the displayed string. Defaults to 0.
       
-      if ( nargin < 2 ), group_or_set = '/'; n_tabs = 0; end;
-      if ( nargin < 3 ), n_tabs = 0; end;
+      if ( nargin < 2 )
+        group_or_set = '/'; 
+        n_tabs = 0;
+        display_children = true;
+      end
+      if ( nargin < 3 )
+        n_tabs = 0;
+        display_children = true;
+      end
+      if ( ~display_children ), return; end;
       info = h5info( obj.h5_file, group_or_set );
       groups = info.Groups;
       spc = '     ';
       for i = 1:numel(groups)
         grp = groups(i);
+        if ( obj.is_container_group(grp.Name) )
+          container_class = obj.get_container_class( grp.Name );
+          display_group_name = sprintf( '%s Group', container_class );
+          display_children = false;
+        else
+          display_group_name = 'Group';
+          display_children = true;
+        end
         tabs = repmat( spc, 1, n_tabs );
         tabs = [ '\n' tabs ];
         split = strsplit( grp.Name, '/' );
-        to_print = sprintf( 'Group ''%s/''', split{end} );
+        to_print = sprintf( '%s ''%s/''', display_group_name, split{end} );
         fprintf( [tabs, to_print] );
         if ( ~isempty(grp.Attributes) )
           print_attrs( grp.Attributes, [tabs, spc] );
         end
-        if ( ~isempty(grp.Datasets) )
+        if ( ~isempty(grp.Datasets) && display_children )
           sets = grp.Datasets;
           tabs = [ tabs, spc ];
           for k = 1:numel(sets)
@@ -863,7 +1255,7 @@ classdef h5_api < handle
           fprintf( '\n' );
         end
         if ( ~isempty(grp.Groups) )
-          obj.overview( grp.Name, n_tabs+1 );
+          obj.overview( grp.Name, n_tabs+1, display_children );
         end
       end
       function print_attrs( attrs, spc )
@@ -879,6 +1271,19 @@ classdef h5_api < handle
         sz = [ '[', strjoin(sz, ' '), ']' ];
         fprintf( [spc, '%s: %s'], kind, sz );
       end
+    end
+    
+    function joined = fullfile(obj, varargin)
+      
+      %   FULLFILE -- Join file parts with a backslash.
+      %
+      %     IN:
+      %       - `varargin` (cell array of strings)
+      %     OUT:
+      %       - `joined` (char)
+      
+      obj.assert__iscellstr( varargin, 'the file parts' );
+      joined = strjoin( varargin, '/' );
     end
     
     function snames = get_set_names(obj, gname)
@@ -898,6 +1303,23 @@ classdef h5_api < handle
       snames = { info.Datasets(:).Name };
     end
     
+    function gnames = get_group_names(obj, gname)
+      
+      %   GET_GROUP_NAMES -- Return an array of subgroup names in the given
+      %     group.
+      %
+      %     IN:
+      %       - `gname` (char) -- Group to query.
+      %     OUT:
+      %       - `gnames` (cell array of strings, {})
+      
+      gname = obj.ensure_leading_backslash( gname );
+      info = h5info( obj.h5_file, gname );
+      gnames = {};
+      if ( isempty(info.Groups) ), return; end;
+      gnames = { info.Groups(:).Name };
+    end
+    
     function anames = get_attr_names(obj, sname)
       
       %   GET_ATTR_NAMES -- Return an array of attribute names in the given
@@ -914,6 +1336,43 @@ classdef h5_api < handle
       anames = {};
       if ( isempty(info.Attributes) ), return; end;
       anames = { info.Attributes(:).Name };
+    end
+    
+    function sz = get_set_size(obj, sname)
+      
+      %   GET_SET_SIZE -- Get the size of a dataset.
+      %
+      %     IN:
+      %       - `sname` (char) -- Dataset to query.
+      %     OUT:
+      %       - `sz` (double)
+      
+      sname = obj.ensure_leading_backslash( sname );
+      obj.assert__is_set( sname );
+      info = h5info( obj.h5_file, sname );
+      sz = info.Dataspace.Size;
+    end
+    
+    function kind = get_container_class(obj, gname)
+      
+      %   GET_CONTAINER_CLASS -- Get the identity of a Container group.
+      %
+      %     If the 'subclass' attritube of the group is empty, `kind`
+      %     is 'Container'. Otherwise, it is the subclass identity.
+      %     
+      %     IN:
+      %       - `gname` (char) -- Path to the Container-housing group.
+      %     OUT:
+      %       - `kind` (char) -- Class of Container.
+      
+      gname = obj.ensure_leading_backslash( gname );
+      obj.assert__is_container_group( gname );
+      subclass = obj.readatt( gname, 'subclass' );
+      if ( isempty(subclass) )
+        kind = obj.readatt( gname, 'class' );
+      else
+        kind = subclass;
+      end
     end
     
     function split = path_components(obj, str)
@@ -972,6 +1431,22 @@ classdef h5_api < handle
         , var_kind, kind, class(var) );
     end
     
+    function assert__iscellstr(var, var_kind)
+      
+      %   ASSERT__ISCELLSTR -- Ensure a variable is a cell array of
+      %     strings.
+      %
+      %     IN:
+      %       - `var` (/any/) -- Variable to identify.
+      %       - `var_kind` (char) |OPTIONAL| -- Optionally specify what
+      %         kind of variable `var` is. E.g., 'filename'. Defaults to
+      %         'input'.
+      
+      if ( nargin < 2 ), var_kind = 'input'; end;
+      assert( iscellstr(var), ['Expected %s to be a cell array of strings;' ...
+        , ' was a ''%s''.'], var_kind, class(var) );
+    end
+    
     function assert__file_exists(filename, kind)
       
       %   ASSERT__FILE_EXISTS -- Ensure a file exists.
@@ -989,33 +1464,3 @@ classdef h5_api < handle
   end
   
 end
-
-% function cont = read_selected(obj, gname, selectors)
-%       
-%       obj.assert__is_group( gname );
-%       gname = obj.ensure_leading_backslash( gname );
-%       labels = obj.read_labels_( gname );
-%       
-%       ind = labels.where( selectors );
-%       numeric = find( ind );
-%       assert( ~isempty(numeric), 'No rows matched the specified criteria.' );
-%       non_contiguous = [ 1; diff( numeric ) ~= 1 ];
-%       non_contiguous = find( non_contiguous );
-%       
-%       if ( non_contiguous(end) ~= sum(ind) )
-%         non_contiguous(end+1) = sum(ind);
-%       end
-%       
-%       data = zeros( sum(ind), 129, 41 );
-%       stp = 1;
-%       for i = 1:numel(non_contiguous)-1
-%         current_inds = numeric( non_contiguous(i) ) : numeric(non_contiguous(i+1)-1);
-%         start = current_inds(1);
-%         count = numel( current_inds );
-%         count = [ count, Inf, Inf ];
-%         data( stp:stp+count(1)-1, :, : ) = h5read( obj.h5_file, [gname, '/data'], [start, 1, 1], count );
-%         stp = stp + count(1);
-%       end      
-%       labels = labels.keep( ind );
-%       cont = Container( data, labels );
-%     end
