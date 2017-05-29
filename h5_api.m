@@ -76,7 +76,7 @@ classdef h5_api < handle
       exists = obj.file_exists( filename );
       assert( ~exists, 'The .h5 file ''%s'' already exists.', filename );
       H5F.create( filename );
-      if ( isnan(obj.h5_file) ), obj.h5_file = filename; end
+      if ( any(isnan(obj.h5_file)) ), obj.h5_file = filename; end
     end
     
     function create_set(obj, spath, sz, chunk, varargin)
@@ -115,19 +115,22 @@ classdef h5_api < handle
     function write(obj, data, sgpath)
       
       %   WRITE -- Write data to a dataset or multiple datasets, depending
-      %     on the type of data.
+      %     on the data-type.
       %
       %     If the dataset(s) already exist, they will be overwritten.
-      %     Otherwise, they will be created as extensible in the first
-      %     dimension.
+      %     Otherwise, they will be created. Numeric matrices / n-d arrays
+      %     are, by default, created as extensible in the first dimension,
+      %     and fixed in the remaining dimensions. Other datatypes are, by
+      %     default, non-extensible.
       %
-      %     obj.write( container, group_path ) writes the data and labels
-      %     of a Container object to datasets '/data' and '/labels' in the
-      %     given group path, marking that group as housing a Container
-      %     object.
-      %
-      %     obj.write( data, set_path ) writes the data of a numeric matrix
-      %     to 
+      %     Supported datatypes include: Container, double / logical
+      %     matrices and n-d arrays, scalar structs, cell arrays of
+      %     strings, and char arrays.
+      %     
+      %     IN:
+      %       - `data` (/see above/) -- Data to write.
+      %       - `sgpath` (char) -- Path to the set or group in which to
+      %         save.
       
       if ( isa(data, 'Container') )
         obj.write_container( data, sgpath );
@@ -160,7 +163,7 @@ classdef h5_api < handle
       gname = obj.ensure_leading_backslash( gname );      
       snames = { 'data', 'labels', 'indices', 'categories' };
       for i = 1:numel(snames)
-        full_sname = sprintf( '%s/%s', gname, snames{i} );
+        full_sname = obj.fullfile( gname, snames{i} );
         if ( obj.is_set(full_sname) )
           obj.unlink( full_sname );
         end
@@ -564,8 +567,8 @@ classdef h5_api < handle
       %     selector types are 'only', 'only not', and 'except'.
       %
       %     IN:
-      %       - `sgpath` (char) -- Path to the group housing /data and
-      %         /labels datasets, or to the dataset to read.
+      %       - `sgpath` (char) -- Path to the group or dataset from which
+      %         to read.
       %       - `varargin` (cell array) |OPTIONAL| -- Index, or selector 
       %         type / selectors.
       %     OUT:
@@ -576,20 +579,17 @@ classdef h5_api < handle
       err_msg = [ 'Too many input arguments; Can only specify selectors' ...
         , ' if the given path is to a Container group.' ];
       if ( obj.is_group(sgpath) )
-        kind = obj.readatt( sgpath, 'class' );
-        switch ( kind )
-          case 'Container'
-            if ( ~addtl_inputs_given )
-              data = obj.read_container_( sgpath );
-            else
-              data = obj.read_container_selected_( sgpath, varargin{:} );
-            end
-          case 'struct'
-            assert( ~addtl_inputs_given, err_msg );
-            data = obj.read_struct_( sgpath );
-          otherwise
-            error( ['Reading data of class ''%s'' is not currently' ...
-              , ' supported.'], kind );
+        if ( obj.is_container_group(sgpath) )
+          if ( ~addtl_inputs_given )
+            data = obj.read_container_( sgpath );
+          else
+            data = obj.read_container_selected_( sgpath, varargin{:} );
+          end
+        elseif ( obj.is_struct_group(sgpath) )
+          assert( ~addtl_inputs_given, err_msg );
+          data = obj.read_struct_( sgpath );
+        else
+          error( 'The group ''%s'' cannot be read from directly.', sgpath );
         end
       else
         obj.assert__is_set( sgpath );
@@ -765,6 +765,8 @@ classdef h5_api < handle
       %
       %     IN:
       %       - `spath` (char) -- Path to the dataset to read.
+      %     OUT:
+      %       - `data` (cell array of strings)
       
       obj.assert__is_set( spath );
       obj.assert__file_exists( obj.h5_file );
@@ -785,6 +787,8 @@ classdef h5_api < handle
       %
       %     IN:
       %       - `sgpath` (char) -- Path to the struct-to-read.
+      %     OUT:
+      %       - `data` (struct)
       
       assert( obj.is_struct_group(sgpath), ['The path ''%s'' is not' ...
         , ' to a struct.'], sgpath );
@@ -880,7 +884,7 @@ classdef h5_api < handle
       fileattrib( obj.h5_file, '+w' );
       fid = H5F.open( obj.h5_file, 'H5F_ACC_RDWR', 'H5P_DEFAULT' );
       H5L.delete( fid, sname, 'H5P_DEFAULT' );
-      H5F.close(fid);
+      H5F.close( fid );
     end
     
     function remove(obj, selectors, gpath)
@@ -915,7 +919,7 @@ classdef h5_api < handle
       %     to the data is overwritten; the data still resides in the file,
       %     but the path to that data is lost. rebuild() copies each
       %     link to a new .h5 file, such that only the linked data is
-      %     retained. This reclaims storage space.
+      %     retained. This reclaims the lost storage space.
       
       current_h5 = obj.h5_file;
       obj.assert__file_exists( current_h5 );
@@ -962,6 +966,56 @@ classdef h5_api < handle
         H5P.close( ocpl );
         H5P.close( lcpl );
       end
+    end
+    
+    function tf = contains_(obj, selectors, gpath, kind)
+      
+      %   CONTAINS_ -- Private. Check whether the Container group contains
+      %     the given labels or categories.
+      %
+      %     IN:
+      %       - `selectors` (cell array of strings, char)
+      %       - `gpath` (char) -- Path to the Container-housing group.
+      %       - `kind` (char) -- 'labels' or 'categories'
+      %     OUT:
+      %       - `tf` (logical) -- Index of whether each labs(i) is
+      %         present in the group.
+      
+      selectors = obj.ensure_cell( selectors );
+      obj.assert__iscellstr( selectors, sprintf('the %s', kind) );
+      obj.assert__is_container_group( gpath );
+      labs_or_cats = obj.read( obj.fullfile(gpath, kind) );
+      tf = cellfun( @(x) any(strcmp(labs_or_cats, x)), selectors );
+    end
+    
+    function tf = contains_labels(obj, labs, gpath)
+      
+      %   CONTAINS_LABELS -- Check whether the Container group contains the 
+      %     given labels.
+      %
+      %     IN:
+      %       - `labs` (cell array of strings, char)
+      %       - `gpath` (char) -- Path to the Container-housing group.
+      %     OUT:
+      %       - `tf` (logical) -- Index of whether each labs(i) is
+      %         present in the group.
+      
+      tf = obj.contains_( labs, gpath, 'labels' );
+    end
+    
+    function tf = contains_categories(obj, cats, gpath)
+      
+      %   CONTAINS_CATEGORIES -- Check whether the Container group contains
+      %     the given categories
+      %
+      %     IN:
+      %       - `labs` (cell array of strings, char)
+      %       - `gpath` (char) -- Path to the Container-housing group.
+      %     OUT:
+      %       - `tf` (logical) -- Index of whether each labs(i) is
+      %         present in the group.
+      
+      tf = obj.contains_( cats, gpath, 'categories' );    
     end
     
     %{
@@ -1284,6 +1338,13 @@ classdef h5_api < handle
       
       obj.assert__iscellstr( varargin, 'the file parts' );
       joined = strjoin( varargin, '/' );
+    end
+    
+    function arr = ensure_cell(obj, arr)
+      
+      %   ENSURE_CELL -- Ensure an input is a cell array.
+      
+      if ( ~iscell(arr) ), arr = { arr }; end;
     end
     
     function snames = get_set_names(obj, gname)
