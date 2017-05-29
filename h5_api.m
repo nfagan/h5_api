@@ -1222,7 +1222,7 @@ classdef h5_api < handle
       if ( ~display_children ), return; end;
       info = h5info( obj.h5_file, group_or_set );
       groups = info.Groups;
-      spc = '     ';
+      spc = '  ';
       for i = 1:numel(groups)
         grp = groups(i);
         if ( obj.is_container_group(grp.Name) )
