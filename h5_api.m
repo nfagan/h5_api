@@ -898,11 +898,15 @@ classdef h5_api < handle
       
       gpath = obj.ensure_leading_backslash( gpath );
       obj.assert__is_group( gpath );
-      
+      msg = '\n No data matched the given selectors ...';
+      if ( isempty(selectors) )
+        fprintf( msg );
+        return;
+      end
       labs = obj.read_labels_( gpath );
       [~, ind] = labs.remove( selectors );
       if ( ~any(ind) )
-        fprintf( '\n No data matched the given selectors ...' );
+        fprintf( msg );
         return;
       end      
       cont = obj.read_container_( gpath );
@@ -1379,6 +1383,21 @@ classdef h5_api < handle
       gnames = {};
       if ( isempty(info.Groups) ), return; end;
       gnames = { info.Groups(:).Name };
+    end
+    
+    function gnames = get_component_group_names(obj, gpath)
+      
+      %   GET_COMPONENT_GROUP_NAMES -- Return an array of subgroup names
+      %     without the full path to the group.
+      %
+      %     IN:
+      %       - `gpath` (char) -- Group to query.
+      %     OUT:
+      %       - `gnames` (cell array of strings, {})
+      
+      gnames = obj.get_group_names( gpath );
+      gnames = cellfun( @(x) obj.path_components(x), gnames, 'un', false );
+      gnames = cellfun( @(x) x{end}, gnames, 'un', false );
     end
     
     function anames = get_attr_names(obj, sname)
