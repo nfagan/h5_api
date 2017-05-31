@@ -4,6 +4,7 @@ classdef h5_api < handle
     h5_file = NaN;
     CHUNK_SIZE = [1e3 1e2 1e2];
     COMPRESSION_LEVEL = 4;
+    SELECTOR_TYPES = { 'only', 'only not', 'only_not', 'except' };
   end
   
   methods
@@ -612,21 +613,24 @@ classdef h5_api < handle
       end
     end
     
-    function cont = read_container_(obj, gpath)
+    function cont = read_container_(obj, gpath, varargin)
       
       %   READ_CONTAINER_ -- Read in a Container object from a given group.
       %
       %     IN:
       %       - `gpath` (char) -- Path to the group to read.
+      %       - `varargin` (cell array) |OPTIONAL| -- Optionally specify
+      %         the starts + counts at which to read data.
       %     OUT:
       %       - `cont` (Container) -- Loaded Container object.
       
       labels = obj.read_labels_( gpath );
-      data = obj.read( [gpath, '/data'] );
+      data = obj.read( [gpath, '/data'], varargin{:} );
       cont = Container( data, labels );
     end
     
-    function [cont, ind] = read_container_selected_(obj, gpath, selector_type, selectors)
+    function [cont, ind] = read_container_selected_(obj, gpath ...
+        , selector_type, selectors, varargin)
       
       %   READ_CONTAINER_SELECTED_ -- Read a subset of the data in a
       %     Container group associated with the specified selectors and
@@ -636,7 +640,9 @@ classdef h5_api < handle
       %       - `gpath` (char) -- Path to the Container-housing group.
       %       - `selector_type` (char) -- 'only', 'only_not', or 'exclude'
       %       - `selectors` (cell array of strings, char) -- Labels to
-      %         select.     
+      %         select.
+      %       - `varargin` (cell array) |OPTIONAL| -- Optionally specify
+      %         the starts and counts at which to read data.
       %     OUT:
       %       - `cont` (Container) -- Loaded Container object.
       %       - `ind` (logical) -- Index used to select rows for `cont`.
@@ -644,12 +650,12 @@ classdef h5_api < handle
       labels = obj.read_labels_( gpath );
       ind = obj.get_index_of_selectors( labels, selector_type, selectors );
       assert( any(ind), 'No data matched the given criteria.' );
-      data = obj.read_matrix_rows_at_index( ind, [gpath, '/data'] );
+      data = obj.read_matrix_rows_at_index( ind, [gpath, '/data'], varargin{:} );
       labels = labels.keep( ind );
       cont = Container( data, labels );
     end
     
-    function data = read_matrix_rows_at_index(obj, ind, sname)
+    function data = read_matrix_rows_at_index(obj, ind, sname, nd_starts, nd_counts)
       
       %   READ_MATRIX_ROWS_AT_INDICES -- Read rows of data at which `ind`
       %     is true.
@@ -658,7 +664,17 @@ classdef h5_api < handle
       %       - `ind` (logical) -- 1-column matrix specifying elements to
       %         read.
       %       - `sname` (char) -- Path to the dataset to read.
+      %       - `nd_starts` (double) |OPTIONAL| -- Optionally specify the
+      %         start index for dimensions > 1.
+      %       - `nd_counts` (double) |OPTIONAL| -- Optionally specify the
+      %         counts for dimensions > 1.
       
+      if ( nargin < 5 )
+        narginchk( 3, 3 );
+        auto_start_count = true;
+      else
+        auto_start_count = false;
+      end
       obj.assert__is_set( sname );
       sname = obj.ensure_leading_backslash( sname );
       inds = obj.find_contiguous_indices( ind );
@@ -666,14 +682,23 @@ classdef h5_api < handle
       counts = inds(:, 2) - inds(:, 1);
       sz = obj.get_set_size( sname );
       dims = numel( sz );
-      addtl = ones( 1, dims-1 );
+      if ( auto_start_count )
+        addtl_starts = ones( 1, dims-1 );
+        addtl_counts = sz(2:end);
+      else
+        msg = 'The given %s are improperly dimensioned';
+        assert( numel(nd_starts) == (dims-1), msg, 'starts' );
+        assert( numel(nd_starts) == numel(nd_counts), msg, 'counts' );
+        addtl_starts = nd_starts(:)';
+        addtl_counts = nd_counts(:)';
+      end
       n_rows = sum( ind );
-      data = zeros( [n_rows, sz(2:end)] );
+      data = zeros( [n_rows, addtl_counts] );
       colons = repmat( {':'}, 1, dims-1 );
       stp = 1;
       for i = 1:numel(starts)
-        start = [ starts(i), addtl ];
-        count = [ counts(i), sz(2:end) ];
+        start = [ starts(i), addtl_starts ];
+        count = [ counts(i), addtl_counts ];
         some_data = obj.read( sname, start, count );
         data( stp:stp+count(1)-1, colons{:} ) = some_data;
         stp = stp + count(1);
@@ -912,6 +937,24 @@ classdef h5_api < handle
       cont = obj.read_container_( gpath );
       cont = cont.keep( ~ind );      
       obj.write_container( cont, gpath );
+    end
+    
+    function copy_subset_to_file(obj, sgpath, filename, varargin)
+      
+      %   COPY_SUBSET_TO_FILE -- Copy a group or set to a new .h5 file.
+      %
+      %     IN:
+      %       - `sgpath` (char) -- Path to the set or group to copy.
+      %       - `filename` (char) -- New file in which to save.
+      %       - `varargin` (cell array) -- Additional arguments to pass
+      %         when reading the dataset / group at `sgpath`.
+      
+      obj.create( filename );
+      data = obj.read( sgpath, varargin{:} );
+      orig_file = obj.h5_file;
+      obj.h5_file = filename;
+      obj.write( data, sgpath );
+      obj.h5_file = orig_file;
     end
     
     function rebuild(obj)
