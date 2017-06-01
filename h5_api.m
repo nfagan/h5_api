@@ -172,31 +172,30 @@ classdef h5_api < handle
       obj.write_container_( container, gname, 1 );
     end
     
-    function write_container_(obj, container, gname, start)
+    function write_labels_(obj, labels, gname, start)
       
-      %   WRITE_CONTAINER_ -- Private function for writing a Container
-      %     object to an extensible dataset, starting from a given row.
+      %   WRITE_LABELS_ -- Save a SparseLabels object.
+      %
+      %     This function is meant to be called only when saving a
+      %     Container object.
+      %
+      %     IN:
+      %       - `labels` (SparseLabels)
+      %       - `gname` (char) -- Path to the Container-housing group.
+      %       - `start` (double) -- Row at which to begin writing.
       
-      data_set_path = [ gname, '/data' ];
-      indices_path = [ gname, '/indices' ];
-      label_path = [ gname, '/labels' ];
-      cat_path = [ gname, '/categories' ];
-      
-      if ( ~isa(container.labels, 'SparseLabels') )
-        container = container.sparse();
-      end
-      
-      data = container.data;
-      labels = container.labels;
+      obj.assert__isa( labels, 'SparseLabels', 'the labels to save' );
+      obj.assert__is_group( gname );
+      gname = obj.ensure_leading_backslash( gname );
       indices = uint8( full(labels.indices) );
       categories = labels.categories;
       labs = labels.labels;
       
-      if ( ~obj.is_set(data_set_path) )
-        obj.write_matrix_( data, data_set_path, 1 );
-        obj.write_matrix_( indices, indices_path, 1, [Inf, Inf], [] ...
-          , 'FillValue', 0 );
-      else
+      indices_path =  obj.fullfile( gname, 'indices' );
+      label_path =    obj.fullfile( gname, 'labels' );
+      cat_path =      obj.fullfile( gname, 'categories' );
+      
+      if ( obj.is_set(indices_path) )
         incoming.indices = indices;
         incoming.labels = labs;
         incoming.categories = categories;
@@ -207,12 +206,38 @@ classdef h5_api < handle
         %   match format of already-stored labels
         [indices, labs, categories] = obj.match_( existing, incoming );
         
-        obj.write_matrix_( data, data_set_path, start );
         obj.write_matrix_( indices, indices_path, start );
+      else
+        %   create the index
+        obj.write_matrix_( indices, indices_path, 1, [Inf, Inf], [] ...
+          , 'FillValue', 0 );
       end
       
       obj.write( labs, label_path );
-      obj.write( categories, cat_path );
+      obj.write( categories, cat_path );      
+    end
+    
+    function write_container_(obj, container, gname, start)
+      
+      %   WRITE_CONTAINER_ -- Private function for writing a Container
+      %     object to an extensible dataset, starting from a given row.
+      
+      data_set_path = obj.fullfile( gname, 'data' );
+      
+      if ( ~isa(container.labels, 'SparseLabels') )
+        container = container.sparse();
+      end
+      
+      data = container.data;
+      labels = container.labels;
+      
+      obj.write_labels_( labels, gname, start );
+      
+      if ( ~obj.is_set(data_set_path) )
+        obj.write_matrix_( data, data_set_path, 1 );
+      else        
+        obj.write_matrix_( data, data_set_path, start );
+      end
       
       obj.writeatt( data_set_path, 'class', 'Container' );
       obj.writeatt( gname, 'class', 'Container' );
@@ -945,11 +970,13 @@ classdef h5_api < handle
       %
       %     IN:
       %       - `sgpath` (char) -- Path to the set or group to copy.
-      %       - `filename` (char) -- New file in which to save.
+      %       - `filename` (char) -- File in which to save.
       %       - `varargin` (cell array) -- Additional arguments to pass
       %         when reading the dataset / group at `sgpath`.
       
-      obj.create( filename );
+      if ( ~obj.file_exists(filename) )
+        obj.create( filename );
+      end
       data = obj.read( sgpath, varargin{:} );
       orig_file = obj.h5_file;
       obj.h5_file = filename;
