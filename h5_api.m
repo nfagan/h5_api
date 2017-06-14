@@ -565,8 +565,7 @@ classdef h5_api < handle
     
     function data = read(obj, sgpath, varargin)
       
-      %   READ -- Load a Container object, matrix, struct, or cell array
-      %     of strings from the given path.
+      %   READ -- Read in data from the given group or set.
       %
       %     data = obj.read( '/ex' );
       %     where '/ex' is a path to a dataset called 'ex' loads the
@@ -621,7 +620,14 @@ classdef h5_api < handle
         obj.assert__is_set( sgpath );
         is_num = obj.readatt( sgpath, 'is_numeric' );
         if ( is_num )
-          data = obj.read_matrix_( sgpath, varargin{:} );
+          should_read_selected = numel( varargin ) > 0 && islogical( varargin{1} );
+          if ( should_read_selected )
+            ind = varargin{1};
+            varargin(1) = [];
+            data = obj.read_matrix_rows_at_index( ind, sgpath, varargin{:} );
+          else
+            data = obj.read_matrix_( sgpath, varargin{:} );
+          end
         else
           assert( ~addtl_inputs_given, err_msg );
           kind = obj.readatt( sgpath, 'class' );
@@ -982,6 +988,72 @@ classdef h5_api < handle
       obj.h5_file = filename;
       obj.write( data, sgpath );
       obj.h5_file = orig_file;
+    end
+    
+    function copy_group(obj, filename, gpath)
+      
+      %   COPY_GROUP -- Copy a group to a second .h5 file.
+      %
+      %     io.copy_group( `filename`, `gpath` ) copies the contents of
+      %     `gpath` to a second .h5 file `filename`. If `filename` does not
+      %     exist, it will be created. If `filename` does exist, it must be
+      %     a .h5 file that does not already contain `gpath`.
+      %
+      %     IN:
+      %       - `filename` (char)
+      %       - `gpath` (char)
+      
+      obj.assert__is_group( gpath );
+      gpath = obj.ensure_leading_backslash( gpath );
+      assert( ~isequal(gpath, '/'), 'Cannot copy the root group ''/''.' );
+      destin = h5_api();
+      if ( ~obj.file_exists(filename) )
+        destin.create( filename );
+      else
+        destin.h5_file = filename;
+        destin.assert__is_not_group( gpath );
+      end
+      fileattrib( obj.h5_file, '+w' );
+      fileattrib( destin.h5_file, '+w' );
+      fid = H5F.open( obj.h5_file, 'H5F_ACC_RDWR', 'H5P_DEFAULT' );
+      fid_dest = H5F.open( destin.h5_file, 'H5F_ACC_RDWR', 'H5P_DEFAULT' );
+      ocpl = H5P.create( 'H5P_OBJECT_COPY' );
+      lcpl = H5P.create( 'H5P_LINK_CREATE' );
+      H5P.set_create_intermediate_group( lcpl, true );
+      gid = H5G.open( fid, gpath );
+      gid_dest = H5G.open( fid_dest, '/' );
+      success = true;
+      try
+        H5O.copy( gid, gpath, gid_dest, gpath, ocpl, lcpl );
+      catch err
+        success = false;
+      end
+      H5G.close( gid );
+      H5G.close( gid_dest );
+      H5P.close( ocpl );
+      H5P.close( lcpl );
+      H5F.close( fid );
+      H5F.close( fid_dest );
+      if ( ~success )
+        throw( err );
+      end
+    end
+    
+    function copy_groups(obj, filename, gpaths)
+      
+      %   COPY_GROUPS -- Copy multiple groups to a second .h5 file.
+      %
+      %     See also h5_api/copy_group
+      %
+      %     IN:
+      %       - `filename` (char)
+      %       - `gpaths` (cell array of strings, char)
+      
+      gpaths = obj.ensure_cell( gpaths );
+      obj.assert__iscellstr( gpaths, 'the group paths' );
+      for i = 1:numel(gpaths)
+        obj.copy_group( filename, gpaths{i} );
+      end
     end
     
     function rebuild(obj)
