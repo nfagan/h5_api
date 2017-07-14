@@ -926,7 +926,7 @@ classdef h5_api < handle
       labels = SparseLabels();
       labels.labels = labs(:);
       labels.categories = categories(:);
-      labels.indices = sparse( indices );      
+      labels.indices = sparse( logical(indices) );      
     end
         
     function unlink(obj, sname)
