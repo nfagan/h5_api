@@ -1056,6 +1056,33 @@ classdef h5_api < handle
       end
     end
     
+    function move(obj, sg_src, sg_dest)
+      
+      %   MOVE -- Move a group to a new location.
+      %
+      %     The destination must not already exist. If you wish to
+      %     overwrite the destination contents, first call obj.unlink() to
+      %     manually remove the destination.
+      %
+      %     IN:
+      %       - `sg_src` (char) -- Path to the source group.
+      %       - `sg_dest` (char) -- Path to the destination group.
+      
+      sg_src = obj.ensure_leading_backslash( sg_src );
+      sg_dest = obj.ensure_leading_backslash( sg_dest );
+      obj.assert__h5_is_defined();
+      obj.assert__is_set_or_group( sg_src );
+      obj.assert__is_not_set( sg_dest );
+      obj.assert__is_not_group( sg_dest );
+      fid = H5F.open( obj.h5_file, 'H5F_ACC_RDWR', 'H5P_DEFAULT' );
+      try
+        H5L.move( fid, sg_src, fid, sg_dest, 'H5P_DEFAULT', 'H5P_DEFAULT' );
+      catch err
+        H5F.close( fid );
+        throw( err );
+      end
+    end
+    
     function rebuild(obj)
       
       %   REBUILD -- Copy the datasets in the .h5 file to a new .h5 file.
