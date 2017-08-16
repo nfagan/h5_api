@@ -113,6 +113,19 @@ classdef h5_api < handle
       obj.writeatt( spath, 'next_row', 0 );
     end
     
+    function require_group(obj, pathstr)
+      
+      %   REQUIRE_GROUP -- Create a group if it does not exist.
+      %
+      %     IN:
+      %       - `pathstr` (char)
+      
+      obj.assert__is_not_set( pathstr );
+      if ( ~obj.is_group(pathstr) )
+        obj.create_group( pathstr );
+      end
+    end
+    
     function write(obj, data, sgpath)
       
       %   WRITE -- Write data to a dataset or multiple datasets, depending
