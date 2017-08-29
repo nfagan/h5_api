@@ -1124,7 +1124,7 @@ classdef h5_api < handle
       
       info = h5info( current_h5 );
       
-      if ( numel(info.Groups > 0) )        
+      if ( numel(info.Groups) > 0 )        
         groups = { info.Groups(:).Name };
         for i = 1:numel(groups)
           copy_one_group( groups{i} );
