@@ -19,7 +19,7 @@ classdef h5_api < handle
       %       - `filename` (char) -- .h5 file to connect to.
       
       if ( nargin == 0 ), return; end;
-      obj.assert__file_exists( filename, 'the .h5 file' );
+      obj.assert__file_exists( filename, '.h5' );
       obj.h5_file = filename;
     end
     
