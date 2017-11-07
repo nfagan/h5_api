@@ -113,6 +113,18 @@ classdef h5_api < handle
       obj.writeatt( spath, 'next_row', 0 );
     end
     
+    function require_file(obj, pathstr)
+      
+      %   REQUIRE_FILE -- Create a .h5 file if it doesn't already exist.
+      %
+      %     IN:
+      %       - `pathstr` (char)
+      
+      if ( ~obj.file_exists(pathstr) )
+        obj.create( pathstr );
+      end
+    end
+    
     function require_group(obj, pathstr)
       
       %   REQUIRE_GROUP -- Create a group if it does not exist.
